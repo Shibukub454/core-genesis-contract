@@ -23,13 +23,13 @@ program.option(
 program.option(
     "--votingPeriod <votingPeriod>",
     "votingPeriod",
-    201600
+    1200
 )
 
 program.option(
     "--executingPeriod <executingPeriod>",
     "executingPeriod",
-    201600
+    1200
 )
 
 program.option("--testnet <testnet>",
