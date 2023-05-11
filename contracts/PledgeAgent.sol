@@ -15,6 +15,8 @@ contract PledgeAgent is IPledgeAgent, System, IParamSubscriber {
   uint256 public constant INIT_REQUIRED_COIN_DEPOSIT = 1e18;
   uint256 public constant INIT_HASH_POWER_FACTOR = 20000;
   uint256 public constant POWER_BLOCK_FACTOR = 1e18;
+  uint256 public constant INIT_DUES_MOLECULE = 100;
+  uint256 public constant INIT_DUES_ATTENUATION_COEFFICIENT = 10000;
 
   uint256 public requiredCoinDeposit;
 
@@ -48,11 +50,19 @@ contract PledgeAgent is IPledgeAgent, System, IParamSubscriber {
   // It is initialized to 1.
   uint256 public roundTag;
 
+  uint256 public duesMolecule;
+
+  uint256 public duesAttenuationCoefficient;
+
   struct CoinDelegator {
+    // the deposit amount used to collect history reward.
+    // if the changeRound over than reward round, use newDeposit instead
     uint256 deposit;
+    // newest deposit amount
     uint256 newDeposit;
     uint256 changeRound;
     uint256 rewardIndex;
+    uint256 dues;
   }
 
   struct Reward {
@@ -104,6 +114,8 @@ contract PledgeAgent is IPledgeAgent, System, IParamSubscriber {
   function init() external onlyNotInit {
     requiredCoinDeposit = INIT_REQUIRED_COIN_DEPOSIT;
     powerFactor = INIT_HASH_POWER_FACTOR;
+    duesMolecule = INIT_DUES_MOLECULE;
+    duesAttenuationCoefficient = INIT_DUES_ATTENUATION_COEFFICIENT;
     roundTag = 1;
     alreadyInit = true;
   }
@@ -252,15 +264,28 @@ contract PledgeAgent is IPledgeAgent, System, IParamSubscriber {
     if (!ICandidateHub(CANDIDATE_HUB_ADDR).canDelegate(agent)) {
       revert InactiveAgent(agent);
     }
-    uint256 newDeposit = delegateCoin(agent, msg.sender, msg.value);
+    uint256 dm = duesMolecule == 0 ? INIT_DUES_MOLECULE : duesMolecule;
+    uint256 dues = msg.value * dm / 10000;
+    uint256 newDeposit = delegateCoin(agent, msg.sender, msg.value, dues);
     emit delegatedCoin(agent, msg.sender, msg.value, newDeposit);
   }
 
   /// Undelegate coin from a validator
   /// @param agent The operator address of validator
   function undelegateCoin(address agent) external {
-    uint256 deposit = undelegateCoin(agent, msg.sender);
-    payable(msg.sender).transfer(deposit);
+    undelegateCoin(agent, 0);
+  }
+
+  /// Undelegate coin from a validator
+  /// @param agent The operator address of validator
+  /// @param amount The coin amount for undelegate
+  function undelegateCoin(address agent, uint256 amount) public {
+    (uint256 deposit, uint256 dues) = undelegateCoin(agent, msg.sender, amount);
+    (bool success, ) = msg.sender.call{value: deposit - dues, gas: 50000}("");
+    if (!success) {
+      rewardMap[msg.sender] += deposit - dues;
+    }
+    payable(SYSTEM_REWARD_ADDR).transfer(dues);
     emit undelegatedCoin(agent, msg.sender, deposit);
   }
 
@@ -268,14 +293,22 @@ contract PledgeAgent is IPledgeAgent, System, IParamSubscriber {
   /// @param sourceAgent The validator to transfer coin stake from
   /// @param targetAgent The validator to transfer coin stake to
   function transferCoin(address sourceAgent, address targetAgent) external {
+    transferCoin(sourceAgent, targetAgent, 0);
+  }
+
+  /// Transfer coin stake to a new validator
+  /// @param sourceAgent The validator to transfer coin stake from
+  /// @param targetAgent The validator to transfer coin stake to
+  /// @param amount The coin amount for transfer
+  function transferCoin(address sourceAgent, address targetAgent, uint256 amount) public {
     if (!ICandidateHub(CANDIDATE_HUB_ADDR).canDelegate(targetAgent)) {
       revert InactiveAgent(targetAgent);
     }
     if (sourceAgent == targetAgent) {
       revert SameCandidate(sourceAgent, targetAgent);
     }
-    uint256 deposit = undelegateCoin(sourceAgent, msg.sender);
-    uint256 newDeposit = delegateCoin(targetAgent, msg.sender, deposit);
+    (uint256 deposit, uint256 dues) = undelegateCoin(sourceAgent, msg.sender, amount);
+    uint256 newDeposit = delegateCoin(targetAgent, msg.sender, deposit, dues);
     emit transferredCoin(sourceAgent, targetAgent, msg.sender, deposit, newDeposit);
   }
 
@@ -296,11 +329,14 @@ contract PledgeAgent is IPledgeAgent, System, IParamSubscriber {
       Agent storage a = agentsMap[agentList[i]];
       if (a.rewardSet.length == 0) continue;
       CoinDelegator storage d = a.cDelegatorMap[msg.sender];
-      if (d.newDeposit == 0) continue;
+      if (d.newDeposit == 0 && d.deposit == 0) continue;
       int256 roundCount = int256(a.rewardSet.length - d.rewardIndex);
       reward = collectCoinReward(a, d, roundLimit);
       roundLimit -= roundCount;
       rewardSum += reward;
+      if (d.newDeposit == 0 && d.deposit == 0) {
+        delete a.cDelegatorMap[msg.sender];
+      }
       // if there are rewards to be collected, leave them there
       if (roundLimit < 0) break;
     }
@@ -312,66 +348,84 @@ contract PledgeAgent is IPledgeAgent, System, IParamSubscriber {
 
   /*********************** Internal methods ***************************/
   function distributeReward(address payable delegator, uint256 reward) internal {
-    (bool success, bytes memory data) = delegator.call{value: reward, gas: 50000}("");
+    (bool success, ) = delegator.call{value: reward, gas: 50000}("");
     emit claimedReward(delegator, msg.sender, reward, success);
     if (!success) {
-      rewardMap[msg.sender] = reward;
+      rewardMap[msg.sender] += reward;
     }
   }
 
-  function delegateCoin(
-    address agent,
-    address delegator,
-    uint256 deposit
-  ) internal returns (uint256) {
-    Agent storage a = agentsMap[agent];
-    uint256 newDeposit = a.cDelegatorMap[delegator].newDeposit + deposit;
-
-    a.totalDeposit += deposit;
-    if (newDeposit == deposit) {
-      require(deposit >= requiredCoinDeposit, "deposit is too small");
-      uint256 rewardIndex = a.rewardSet.length;
-      a.cDelegatorMap[delegator] = CoinDelegator(0, deposit, roundTag, rewardIndex);
-    } else {
-      require(deposit != 0, "deposit value is zero");
-      CoinDelegator storage d = a.cDelegatorMap[delegator];
-      uint256 rewardAmount = collectCoinReward(a, d, 0x7FFFFFFF);
-      if (d.changeRound < roundTag) {
-        d.deposit = d.newDeposit;
-        d.changeRound = roundTag;
-      }
-      d.newDeposit = newDeposit;
-      if (rewardAmount > 0) {
-        distributeReward(payable(delegator), rewardAmount);
-      }
-    }
-    return newDeposit;
-  }
-
-  function undelegateCoin(address agent, address delegator) internal returns (uint256) {
+  function delegateCoin(address agent, address delegator, uint256 deposit, uint256 dues) internal returns (uint256) {
+    require(deposit >= requiredCoinDeposit, "deposit is too small");
     Agent storage a = agentsMap[agent];
     CoinDelegator storage d = a.cDelegatorMap[delegator];
     uint256 newDeposit = d.newDeposit;
-    require(newDeposit != 0, "delegator does not exist");
-
-    uint256 rewardAmount = collectCoinReward(a, d, 0x7FFFFFFF);
-
-    a.totalDeposit -= newDeposit;
-    if (a.rewardSet.length != 0) {
-      Reward storage r = a.rewardSet[a.rewardSet.length - 1];
-      if (r.round == roundTag) {
-        if (d.changeRound < roundTag) {
-          r.coin -= newDeposit;
-        } else {
-          r.coin -= d.deposit;
-        }
-      }
+    uint256 rewardAmount;
+    uint256 changeRound = d.changeRound;
+    if (changeRound != 0) {
+      rewardAmount = collectCoinReward(a, d, 0x7FFFFFFF);
     }
-    delete a.cDelegatorMap[delegator];
+
+    uint256 curRound = roundTag;
+    if (newDeposit == 0 && d.deposit == 0) {
+      a.cDelegatorMap[delegator] = CoinDelegator(0, deposit, curRound, a.rewardSet.length, dues);
+    } else {
+      if (changeRound < curRound) {
+        uint256 dac = duesAttenuationCoefficient == 0 ? INIT_DUES_ATTENUATION_COEFFICIENT : duesAttenuationCoefficient;
+        uint256 attenuationDues = newDeposit * (curRound - changeRound) / dac;
+        uint256 newDues = d.dues;
+        newDues = newDues > attenuationDues ? newDues - attenuationDues : 0;
+        d.dues = newDues + dues;
+        d.deposit = newDeposit;
+        d.changeRound = curRound;
+      }
+      newDeposit += deposit;
+      d.newDeposit = newDeposit;
+    }
+
+    a.totalDeposit += deposit;
+    if (rewardAmount != 0) {
+        distributeReward(payable(delegator), rewardAmount);
+    }
+    return newDeposit;
+  }
+
+  function undelegateCoin(address agent, address delegator, uint256 amount) internal returns (uint256, uint256) {
+    Agent storage a = agentsMap[agent];
+    CoinDelegator storage d = a.cDelegatorMap[delegator];
+    uint256 newDeposit = d.newDeposit;
+    if (amount == 0) amount = newDeposit;
+    require(newDeposit != 0, "delegator does not exist");
+    if (newDeposit != amount) {
+      require(amount >= requiredCoinDeposit, "undelegate amount is too small"); 
+      require(newDeposit >= requiredCoinDeposit + amount, "remain amount is too small");
+    }
+    uint256 rewardAmount = collectCoinReward(a, d, 0x7FFFFFFF);
+    a.totalDeposit -= amount;
+
+    uint256 curRound = roundTag;
+    uint256 changeRound = d.changeRound;
+    uint256 dac = duesAttenuationCoefficient == 0 ? INIT_DUES_ATTENUATION_COEFFICIENT : duesAttenuationCoefficient;
+    uint256 attenuationDues = newDeposit * (curRound - changeRound) / dac;
+    uint256 newDues = d.dues;
+    newDues = newDues > attenuationDues ? newDues - attenuationDues : 0;
+    uint256 undelegateDues = newDues * amount / newDeposit;
+
+    if (newDeposit == amount && (a.rewardSet.length == 0 || a.rewardSet[a.rewardSet.length - 1].round != curRound)) {
+        delete a.cDelegatorMap[delegator];
+    } else {
+      if(changeRound != curRound) {
+        d.changeRound = curRound;
+        d.deposit = newDeposit;
+      }
+      d.dues = newDues - undelegateDues;
+      d.newDeposit = newDeposit - amount;
+    }
+
     if (rewardAmount > 0) {
       distributeReward(payable(delegator), rewardAmount);
     }
-    return newDeposit;
+    return (amount, undelegateDues);
   }
 
   function collectCoinReward(
@@ -439,6 +493,18 @@ contract PledgeAgent is IPledgeAgent, System, IParamSubscriber {
         revert OutOfBounds(key, newHashPowerFactor, 1, type(uint256).max);
       }
       powerFactor = newHashPowerFactor;
+    } else if (Memory.compareStrings(key, "duesMolecule")) {
+      uint256 newDuesMolecule = BytesToTypes.bytesToUint256(32, value);
+      if (newDuesMolecule == 0 || newDuesMolecule > 10000) {
+        revert OutOfBounds(key, newDuesMolecule, 1, 10000);
+      }
+      duesMolecule = newDuesMolecule;
+    } else if (Memory.compareStrings(key, "duesAttenuationCoefficient")) {
+      uint256 newDuesAttenuationCoefficient = BytesToTypes.bytesToUint256(32, value);
+      if (newDuesAttenuationCoefficient == 0) {
+        revert OutOfBounds(key, newDuesAttenuationCoefficient, 1, 10000);
+      }
+      duesAttenuationCoefficient = newDuesAttenuationCoefficient;
     } else {
       require(false, "unknown param");
     }
